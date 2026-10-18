@@ -1,0 +1,250 @@
+### Ledger service HTTP tests (IntelliJ HTTP Client; select the "local" environment).
+### Start the service first: ./gradlew run
+### Run the requests top to bottom. Account ids get a per-run suffix, so the file can be re-run.
+
+### 1. Create account "alice" with 100
+< {%
+    const run = Date.now();
+    client.global.set("alice", "alice-" + run);
+    client.global.set("bob", "bob-" + run);
+    client.global.set("correlationId", "correlation-" + run);
+%}
+POST {{host}}/accounts
+Content-Type: application/json
+
+{"id": "{{alice}}", "openingBalance": 100}
+
+> {%
+    client.test("account created", () => {
+        client.assert(response.status === 201, "expected 201, got " + response.status);
+        client.assert(response.body.balance === 100);
+    });
+%}
+
+### 2. Create account "bob" with default balance 0
+POST {{host}}/accounts
+Content-Type: application/json
+
+{"id": "{{bob}}"}
+
+> {%
+    client.test("account created with zero balance", () => {
+        client.assert(response.status === 201);
+        client.assert(response.body.balance === 0);
+    });
+%}
+
+### 3. Creating the same account again conflicts
+POST {{host}}/accounts
+Content-Type: application/json
+
+{"id": "{{alice}}", "openingBalance": 999}
+
+> {%
+    client.test("duplicate account is 409", () => {
+        client.assert(response.status === 409);
+    });
+%}
+
+### 4. Negative opening balance is a bad request
+POST {{host}}/accounts
+Content-Type: application/json
+
+{"id": "negative-{{$timestamp}}", "openingBalance": -1}
+
+> {%
+    client.test("negative opening balance is 400", () => {
+        client.assert(response.status === 400);
+    });
+%}
+
+### 5. Read balance
+GET {{host}}/accounts/{{alice}}
+
+> {%
+    client.test("balance is 100", () => {
+        client.assert(response.status === 200);
+        client.assert(response.body.id === client.global.get("alice"));
+        client.assert(response.body.balance === 100);
+    });
+%}
+
+### 6. Unknown account
+GET {{host}}/accounts/does-not-exist
+
+> {%
+    client.test("unknown account is 404", () => {
+        client.assert(response.status === 404);
+    });
+%}
+
+### 7. Transfer 30 from alice to bob
+POST {{host}}/transfers
+Content-Type: application/json
+Correlation-Id: {{correlationId}}
+
+{"from": "{{alice}}", "to": "{{bob}}", "amount": 30}
+
+> {%
+    client.test("transfer completed", () => {
+        client.assert(response.status === 201);
+        client.assert(response.body.status === "COMPLETED");
+        client.global.set("transferId", String(response.body.transferId));
+    });
+%}
+
+### 8. Retry with the same key: same outcome, applied once
+POST {{host}}/transfers
+Content-Type: application/json
+Correlation-Id: {{correlationId}}
+
+{"from": "{{alice}}", "to": "{{bob}}", "amount": 30}
+
+> {%
+    client.test("retry replays the original outcome", () => {
+        client.assert(response.status === 201);
+        client.assert(String(response.body.transferId) === client.global.get("transferId"));
+    });
+%}
+
+### 9. Alice was debited once
+GET {{host}}/accounts/{{alice}}
+
+> {%
+    client.test("alice has 70", () => {
+        client.assert(response.body.balance === 70, "got " + response.body.balance);
+    });
+%}
+
+### 10. Bob was credited once
+GET {{host}}/accounts/{{bob}}
+
+> {%
+    client.test("bob has 30", () => {
+        client.assert(response.body.balance === 30, "got " + response.body.balance);
+    });
+%}
+
+### 11. Same key, different body: conflict, nothing applied
+POST {{host}}/transfers
+Content-Type: application/json
+Correlation-Id: {{correlationId}}
+
+{"from": "{{alice}}", "to": "{{bob}}", "amount": 50}
+
+> {%
+    client.test("key reuse with a different body is 409", () => {
+        client.assert(response.status === 409);
+    });
+%}
+
+### 12. Insufficient funds
+POST {{host}}/transfers
+Content-Type: application/json
+Correlation-Id: {{correlationId}}-overdraw
+
+{"from": "{{alice}}", "to": "{{bob}}", "amount": 1000}
+
+> {%
+    client.test("overdraw is rejected with 422", () => {
+        client.assert(response.status === 422);
+        client.assert(response.body.status === "REJECTED");
+        client.assert(response.body.reason === "INSUFFICIENT_FUNDS");
+    });
+%}
+
+### 13. Balance unchanged after rejection
+GET {{host}}/accounts/{{alice}}
+
+> {%
+    client.test("alice still has 70", () => {
+        client.assert(response.body.balance === 70);
+    });
+%}
+
+### 14. Unknown destination account
+POST {{host}}/transfers
+Content-Type: application/json
+Correlation-Id: {{correlationId}}-ghost
+
+{"from": "{{alice}}", "to": "ghost-account", "amount": 10}
+
+> {%
+    client.test("unknown account is rejected with 422", () => {
+        client.assert(response.status === 422);
+        client.assert(response.body.reason === "UNKNOWN_ACCOUNT");
+    });
+%}
+
+### 15. Missing Correlation-Id
+POST {{host}}/transfers
+Content-Type: application/json
+
+{"from": "{{alice}}", "to": "{{bob}}", "amount": 10}
+
+> {%
+    client.test("missing key is 400", () => {
+        client.assert(response.status === 400);
+    });
+%}
+
+### 16. Transfer to the same account
+POST {{host}}/transfers
+Content-Type: application/json
+Correlation-Id: {{correlationId}}-same
+
+{"from": "{{alice}}", "to": "{{alice}}", "amount": 10}
+
+> {%
+    client.test("same account is 400", () => {
+        client.assert(response.status === 400);
+    });
+%}
+
+### 17. Zero amount
+POST {{host}}/transfers
+Content-Type: application/json
+Correlation-Id: {{correlationId}}-zero
+
+{"from": "{{alice}}", "to": "{{bob}}", "amount": 0}
+
+> {%
+    client.test("zero amount is 400", () => {
+        client.assert(response.status === 400);
+    });
+%}
+
+### 18. Fractional amount
+POST {{host}}/transfers
+Content-Type: application/json
+Correlation-Id: {{correlationId}}-fraction
+
+{"from": "{{alice}}", "to": "{{bob}}", "amount": 1.5}
+
+> {%
+    client.test("fractional amount is 400", () => {
+        client.assert(response.status === 400);
+    });
+%}
+
+### 19. Malformed JSON
+POST {{host}}/transfers
+Content-Type: application/json
+Correlation-Id: {{correlationId}}-bad-json
+
+not json
+
+> {%
+    client.test("malformed JSON is 400", () => {
+        client.assert(response.status === 400);
+    });
+%}
+
+### 20. Unknown route
+GET {{host}}/nope
+
+> {%
+    client.test("unknown route is 404", () => {
+        client.assert(response.status === 404);
+    });
+%}
